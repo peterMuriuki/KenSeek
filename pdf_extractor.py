@@ -19,6 +19,7 @@ try:
     from PIL import Image
     from dotenv import load_dotenv
     import google.generativeai as genai
+    from database import ExtractionDatabase
 except ImportError as e:
     print(f"Missing required package: {e}")
     print("Please install requirements: pip install -r requirements.txt")
@@ -122,13 +123,16 @@ IMPORTANT:
 class PDFFinancialExtractor:
     """Extract financial data from PDFs using Gemini (OCR) + DeepSeek (extraction)."""
 
-    def __init__(self, api_key: Optional[str] = None, gemini_api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, gemini_api_key: Optional[str] = None,
+                 use_database: bool = True, db_path: str = "./extractions.db"):
         """
         Initialize the extractor with API credentials.
 
         Args:
             api_key: DeepSeek API key (for financial extraction)
             gemini_api_key: Google Gemini API key (for OCR preprocessing)
+            use_database: Enable database caching and tracking
+            db_path: Path to SQLite database file
         """
         # DeepSeek setup (for extraction)
         self.api_key = api_key or DEEPSEEK_API_KEY
@@ -150,6 +154,14 @@ class PDFFinancialExtractor:
         else:
             self.gemini_model = None
             print("[INIT] ⚠ Gemini API key not found. OCR mode will not be available.")
+
+        # Database setup (for caching and tracking)
+        self.use_database = use_database
+        if use_database:
+            self.db = ExtractionDatabase(db_path)
+            print(f"[INIT] ✓ Database initialized ({db_path})")
+        else:
+            self.db = None
 
     def pdf_to_images(self, pdf_path: str, dpi: int = 150) -> List[Image.Image]:
         """Convert PDF pages to images."""
@@ -421,21 +433,23 @@ class PDFFinancialExtractor:
         self,
         pdf_path: str,
         max_pages: Optional[int] = None,
-        use_gemini: bool = True
-    ) -> List[str]:
+        use_gemini: bool = True,
+        force_reocr: bool = False
+    ) -> Tuple[List[str], Optional[int]]:
         """
         OCR all pages of a PDF using Google Gemini Vision API.
 
-        Processes each page individually to extract text,
-        then returns all OCRed text for downstream processing.
+        Checks cache first. If cached OCR exists and file hash matches,
+        returns cached text. Otherwise, performs OCR and caches results.
 
         Args:
             pdf_path: Path to the PDF file
             max_pages: Maximum number of pages to OCR (None for all)
             use_gemini: Use Gemini API for OCR (default: True)
+            force_reocr: Force re-OCR even if cached (default: False)
 
         Returns:
-            List of OCRed text strings, one per page
+            Tuple of (list of OCR text per page, PDF ID in database)
         """
         if not self.gemini_model:
             raise ValueError("Gemini API not configured. Set GEMINI_API_KEY in .env file.")
@@ -445,6 +459,38 @@ class PDFFinancialExtractor:
         print(f"{'='*70}")
         print(f"File: {pdf_path}")
         print(f"Model: gemini-2.5-flash-lite")
+
+        # Check cache first
+        pdf_id = None
+        if self.use_database and not force_reocr:
+            print(f"\n[CACHE] Checking for cached OCR...")
+            file_hash = ExtractionDatabase.compute_file_hash(pdf_path)
+            print(f"[CACHE] File hash: {file_hash[:16]}...")
+
+            pdf_record = self.db.get_pdf_by_hash(file_hash)
+            if pdf_record:
+                pdf_id = pdf_record['id']
+                cached_ocr = self.db.get_cached_ocr(pdf_id)
+
+                if cached_ocr:
+                    print(f"[CACHE] ✓ Found cached OCR!")
+                    print(f"[CACHE] Pages: {len(cached_ocr)}")
+                    print(f"[CACHE] OCR date: {pdf_record['ocr_date']}")
+                    print(f"[CACHE] Total characters: {sum(len(text) for text in cached_ocr):,}")
+                    print(f"[CACHE] Skipping OCR (using cache)")
+                    print(f"{'='*70}\n")
+
+                    # Apply max_pages limit to cached results
+                    if max_pages:
+                        return cached_ocr[:max_pages], pdf_id
+                    return cached_ocr, pdf_id
+                else:
+                    print(f"[CACHE] PDF found but no OCR cached, will perform OCR")
+            else:
+                print(f"[CACHE] PDF not in cache, will perform OCR")
+        elif force_reocr:
+            print(f"[CACHE] Force re-OCR enabled, skipping cache")
+
         print(f"Cost: ~$0.10 per 1M tokens (images + text)")
 
         # Convert PDF to images
@@ -497,9 +543,20 @@ class PDFFinancialExtractor:
         if len(images) > 0:
             avg_chars = total_chars // len(images) if len(images) > 0 else 0
             print(f"[OCR] Average per page: {avg_chars:,} chars")
+
+        # Cache OCR results in database
+        if self.use_database:
+            if pdf_id is None:
+                # Create PDF record
+                file_hash = ExtractionDatabase.compute_file_hash(pdf_path)
+                pdf_id = self.db.get_or_create_pdf(pdf_path, file_hash, len(images))
+
+            # Cache OCR text
+            self.db.cache_ocr_text(pdf_id, ocred_pages, "gemini-2.5-flash-lite")
+
         print(f"{'='*70}\n")
 
-        return ocred_pages
+        return ocred_pages, pdf_id
 
     def _ocr_local(self, image: Image.Image) -> str:
         """OCR using local DeepSeek-OCR model."""
@@ -695,31 +752,36 @@ OCRed Document Text:
         pdf_path: str,
         max_pages: Optional[int] = None,
         model: str = "deepseek-chat",
-        save_ocr: bool = True
+        save_ocr: bool = True,
+        num_samples: int = 3
     ) -> Dict:
         """
-        Two-stage extraction: OCR then extract from text.
+        Two-stage extraction with self-consistency: OCR then extract with consensus.
 
-        Stage 1: OCR each page to extract text
-        Stage 2: Extract financial data from the combined text
+        Stage 1: OCR each page to extract text (uses cache if available)
+        Stage 2: Extract financial data with self-consistency (multiple samples)
+        Stage 3: Compute consensus via majority voting
 
         This approach:
-        - Reduces payload size by 90%+
+        - Reduces payload size by 90%+ (OCR to text)
         - Handles much larger PDFs (50+ pages)
         - Lower cost (text tokens cheaper than images)
-        - More reliable for text-heavy documents
+        - Higher accuracy (self-consistency with 3+ samples)
+        - Caches OCR for reuse
+        - Tracks all attempts in database
 
         Args:
             pdf_path: Path to the PDF file
             max_pages: Maximum number of pages to process
             model: DeepSeek model to use
             save_ocr: Save OCRed text to file
+            num_samples: Number of samples for self-consistency (default: 3)
 
         Returns:
-            Dictionary containing extracted financial metrics
+            Dictionary containing extracted financial metrics with confidence scores
         """
-        # Stage 1: OCR (using Gemini Vision API)
-        ocred_pages = self.ocr_pdf_pages(pdf_path, max_pages, use_gemini=True)
+        # Stage 1: OCR (using Gemini Vision API, with caching)
+        ocred_pages, pdf_id = self.ocr_pdf_pages(pdf_path, max_pages, use_gemini=True)
 
         # Combine all pages
         full_text = "\n\n=== PAGE BREAK ===\n\n".join(
@@ -728,23 +790,201 @@ OCRed Document Text:
         )
 
         # Save OCR text if requested
+        ocr_file = None
         if save_ocr:
             ocr_file = Path(pdf_path).stem + "_ocr.txt"
             with open(ocr_file, 'w', encoding='utf-8') as f:
                 f.write(full_text)
             print(f"[OCR] Saved OCR text to: {ocr_file}")
 
-        # Stage 2: Extract from text
-        result = self.extract_from_ocr_text(full_text, pdf_path, model)
+        # Create extraction attempt record
+        attempt_id = None
+        if self.use_database:
+            # Ensure pdf_id exists
+            if pdf_id is None:
+                file_hash = ExtractionDatabase.compute_file_hash(pdf_path)
+                pdf_id = self.db.get_or_create_pdf(pdf_path, file_hash, len(ocred_pages))
+
+            attempt_id = self.db.create_extraction_attempt(
+                pdf_id=pdf_id,
+                model=model,
+                num_samples=num_samples,
+                extraction_method="ocr_text_with_consistency"
+            )
+            print(f"[DB] ✓ Created extraction attempt #{attempt_id}")
+
+        # Stage 2 & 3: Extract with self-consistency
+        try:
+            result = self._extract_with_consistency_from_text(
+                full_text=full_text,
+                pdf_path=pdf_path,
+                model=model,
+                num_samples=num_samples,
+                attempt_id=attempt_id
+            )
+
+            # Mark attempt as successful
+            if self.use_database and attempt_id:
+                self.db.complete_extraction_attempt(attempt_id, success=True)
+
+        except Exception as e:
+            # Mark attempt as failed
+            if self.use_database and attempt_id:
+                self.db.complete_extraction_attempt(attempt_id, success=False, error_message=str(e))
+            raise
 
         # Add OCR metadata
         result["ocr_metadata"] = {
             "num_pages": len(ocred_pages),
             "total_characters": len(full_text),
-            "ocr_saved_to": ocr_file if save_ocr else None
+            "ocr_saved_to": ocr_file,
+            "pdf_id": pdf_id,
+            "attempt_id": attempt_id
         }
 
         return result
+
+    def _extract_with_consistency_from_text(
+        self,
+        full_text: str,
+        pdf_path: str,
+        model: str,
+        num_samples: int,
+        attempt_id: Optional[int] = None
+    ) -> Dict:
+        """
+        Extract financial data from text with self-consistency.
+
+        Runs multiple extraction samples, tracks each in database,
+        and computes consensus via majority voting.
+
+        Args:
+            full_text: Full OCRed text
+            pdf_path: Original PDF path
+            model: DeepSeek model to use
+            num_samples: Number of samples for self-consistency
+            attempt_id: Database attempt ID for tracking
+
+        Returns:
+            Dictionary with consensus extraction results and confidence scores
+        """
+        print(f"\n{'='*70}")
+        print(f"SELF-CONSISTENCY EXTRACTION ({num_samples} samples)")
+        print(f"{'='*70}")
+        print(f"Model: {model}")
+        print(f"Text length: {len(full_text):,} characters")
+
+        samples = []
+        all_sample_data = []
+
+        # Create text-based extraction prompt
+        text_extraction_prompt = f"""You are analyzing OCRed text from a Kenyan company annual report.
+
+{SYSTEM_PROMPT}
+
+OCRed Document Text:
+{full_text}
+
+{EXTRACTION_PROMPT}"""
+
+        # Run multiple samples
+        for i in range(num_samples):
+            print(f"\n[SAMPLE {i + 1}/{num_samples}] Running extraction...")
+
+            try:
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "user", "content": text_extraction_prompt}
+                    ],
+                    temperature=0.1
+                )
+
+                raw_response = response.choices[0].message.content
+                prompt_tokens = response.usage.prompt_tokens
+                completion_tokens = response.usage.completion_tokens
+
+                # Parse JSON from response
+                financial_data = self._parse_json_from_response(raw_response)
+
+                samples.append(financial_data)
+                all_sample_data.append({
+                    'prompt': text_extraction_prompt,
+                    'response': raw_response,
+                    'data': financial_data,
+                    'prompt_tokens': prompt_tokens,
+                    'completion_tokens': completion_tokens
+                })
+
+                print(f"[SAMPLE {i + 1}/{num_samples}] ✓ Extracted {len(financial_data)} metrics")
+                print(f"[SAMPLE {i + 1}/{num_samples}] Tokens: {prompt_tokens} + {completion_tokens} = {prompt_tokens + completion_tokens}")
+
+                # Save sample to database
+                if self.use_database and attempt_id:
+                    self.db.save_extraction_sample(
+                        attempt_id=attempt_id,
+                        sample_number=i + 1,
+                        prompt_content=text_extraction_prompt,
+                        response_content=raw_response,
+                        extracted_data=financial_data,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens
+                    )
+
+            except Exception as e:
+                print(f"[SAMPLE {i + 1}/{num_samples}] ✗ Failed: {e}")
+                # Continue with other samples even if one fails
+                continue
+
+        if len(samples) == 0:
+            raise RuntimeError("All extraction samples failed")
+
+        print(f"\n[CONSENSUS] Computing consensus from {len(samples)} samples...")
+
+        # Compute consensus
+        consensus_data, confidence_metrics = self._compute_consensus(samples)
+
+        # Save consensus results to database
+        if self.use_database and attempt_id:
+            self.db.save_extraction_results(attempt_id, consensus_data, confidence_metrics)
+            print(f"[DB] ✓ Saved consensus results")
+
+        # Calculate total usage
+        total_prompt_tokens = sum(s['prompt_tokens'] for s in all_sample_data)
+        total_completion_tokens = sum(s['completion_tokens'] for s in all_sample_data)
+
+        # Track costs in database
+        if self.use_database and attempt_id:
+            # DeepSeek pricing: ~$0.14 per 1M input tokens, ~$0.28 per 1M output tokens
+            estimated_cost = (total_prompt_tokens * 0.14 / 1_000_000) + \
+                           (total_completion_tokens * 0.28 / 1_000_000)
+
+            self.db.track_usage_cost(
+                attempt_id=attempt_id,
+                service="deepseek_extraction",
+                model=model,
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                estimated_cost=estimated_cost
+            )
+
+        print(f"{'='*70}\n")
+
+        # Return result in standard format
+        return {
+            "success": True,
+            "file": pdf_path,
+            "model": model,
+            "extraction_method": "ocr_text_with_consistency",
+            "num_samples": len(samples),
+            "extracted_data": consensus_data,
+            "confidence_metrics": confidence_metrics,
+            "usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens
+            }
+        }
 
     def _compute_consensus(self, samples: List[Dict]) -> Tuple[Dict, Dict]:
         """
