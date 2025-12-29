@@ -2,30 +2,35 @@
 
 ## PDF Financial Data Extractor - Common Commands
 
+**Note:** All commands now use `cli.py` as the single entry point.
+
 ### Single File Extraction
 
 ```bash
 # Basic extraction (uses OCR by default)
-python pdf_extractor.py report.pdf --company "SGL Limited" --year "2023"
+python cli.py report.pdf --company "SGL Limited" --year "2023"
 
 # Save to JSON
-python pdf_extractor.py report.pdf --company "SGL Limited" --year "2023" \
+python cli.py report.pdf --company "SGL Limited" --year "2023" \
   --output results.json
+
+# Show reasoning and detailed confidence
+python cli.py report.pdf --show-reasoning --show-confidence
 ```
 
 ### Batch Extraction
 
 ```bash
 # Extract all companies (2 workers, safe default)
-python pdf_extractor.py --folder ./reports --workers 2
+python cli.py --folder ./reports --workers 2
 
 # Extract specific companies (4 workers for speed)
-python pdf_extractor.py --folder ./reports \
+python cli.py --folder ./reports \
   --companies "SGL Limited" "WILLIAMSON TEA KENYA" \
   --workers 4
 
 # Save individual results + summary
-python pdf_extractor.py --folder ./reports \
+python cli.py --folder ./reports \
   --workers 3 \
   --output-dir ./results \
   --batch-summary ./summary.json
@@ -35,18 +40,18 @@ python pdf_extractor.py --folder ./reports \
 
 ```bash
 # Export all to CSV
-python pdf_extractor.py --export results.csv
+python cli.py --export results.csv
 
 # Export with confidence rates (55 columns)
-python pdf_extractor.py --export results.csv --confidence
+python cli.py --export results.csv --confidence
 
 # Export specific company
-python pdf_extractor.py --export results.csv \
+python cli.py --export results.csv \
   --company "SGL Limited" \
   --confidence
 
 # Export with metadata
-python pdf_extractor.py --export results.csv \
+python cli.py --export results.csv \
   --sector "Manufacturing" \
   --sector-short "MFG" \
   --code "001" \
@@ -57,10 +62,10 @@ python pdf_extractor.py --export results.csv \
 
 ```bash
 # 1. Batch extract all PDFs
-python pdf_extractor.py --folder ./reports --workers 4
+python cli.py --folder ./reports --workers 4
 
 # 2. Export to CSV with confidence
-python pdf_extractor.py --export all_companies.csv --confidence
+python cli.py --export all_companies.csv --confidence
 
 # 3. Check results
 head -5 all_companies.csv
@@ -143,10 +148,10 @@ sqlite3 extractions.db "SELECT COUNT(*) FROM extraction_attempts WHERE success =
 sqlite3 extractions.db "SELECT DISTINCT company_name FROM extraction_attempts ORDER BY company_name;"
 
 # Test extraction with limited pages (faster)
-python pdf_extractor.py report.pdf --max-pages 10 --company "Test" --year "2023"
+python cli.py report.pdf --max-pages 10 --company "Test" --year "2023"
 
 # Verify CSV export works
-python pdf_extractor.py --export test.csv --company "SGL Limited"
+python cli.py --export test.csv --company "SGL Limited"
 ```
 
 ## Performance Tips
@@ -178,8 +183,8 @@ pip install -r requirements.txt
 
 ```bash
 # Show all options
-python pdf_extractor.py --help
+python cli.py --help
 
-# Standalone CSV exporter
+# Standalone CSV exporter (alternative)
 python csv_exporter.py --help
 ```
