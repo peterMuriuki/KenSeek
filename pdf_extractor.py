@@ -7,10 +7,13 @@ Extracts 18 financial metrics from Kenyan company annual reports.
 import os
 import json
 import base64
+import re
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 from io import BytesIO
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 import time
 
 try:
@@ -118,6 +121,174 @@ IMPORTANT:
 - It is completely acceptable to have multiple "N/A" values in your response
 - Better to use "N/A" than to guess or estimate a value
 """
+
+
+@dataclass
+class ExtractionJob:
+    """Represents a single extraction job."""
+    pdf_path: str
+    company_name: str
+    financial_year: str
+
+    def __repr__(self):
+        return f"ExtractionJob(company={self.company_name}, year={self.financial_year})"
+
+
+def parse_year_from_filename(filename: str) -> Optional[str]:
+    """
+    Extract year from filename following format: <random_chars>-<YYYY>.pdf
+
+    Args:
+        filename: Name of the PDF file
+
+    Returns:
+        Year as string (YYYY) or None if not found
+
+    Examples:
+        >>> parse_year_from_filename("abc123-2023.pdf")
+        "2023"
+        >>> parse_year_from_filename("report-2022.pdf")
+        "2022"
+        >>> parse_year_from_filename("SGL-Annual-Report-2023.pdf")
+        "2023"
+    """
+    # Match pattern: anything followed by dash and 4 digits (year)
+    match = re.search(r'-(\d{4})(?:\.pdf)?$', filename, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return None
+
+
+def scan_company_folders(root_folder: str, filter_companies: Optional[List[str]] = None) -> List[ExtractionJob]:
+    """
+    Scan root folder for company subfolders and their financial reports.
+
+    Directory structure expected:
+        root_folder/
+        ├── Company_A/
+        │   ├── report-2021.pdf
+        │   ├── report-2022.pdf
+        │   └── report-2023.pdf
+        └── Company_B/
+            └── annual-2023.pdf
+
+    Args:
+        root_folder: Path to root folder containing company subfolders
+        filter_companies: Optional list of company names to process (None = all)
+
+    Returns:
+        List of ExtractionJob objects
+    """
+    root_path = Path(root_folder)
+
+    if not root_path.exists():
+        raise FileNotFoundError(f"Root folder not found: {root_folder}")
+
+    if not root_path.is_dir():
+        raise ValueError(f"Path is not a directory: {root_folder}")
+
+    jobs = []
+
+    # Iterate through company folders
+    for company_folder in sorted(root_path.iterdir()):
+        if not company_folder.is_dir():
+            continue
+
+        company_name = company_folder.name
+
+        # Filter companies if specified
+        if filter_companies and company_name not in filter_companies:
+            continue
+
+        # Scan for PDF files in company folder
+        for pdf_file in sorted(company_folder.glob("*.pdf")):
+            # Extract year from filename
+            year = parse_year_from_filename(pdf_file.name)
+
+            if year:
+                jobs.append(ExtractionJob(
+                    pdf_path=str(pdf_file),
+                    company_name=company_name,
+                    financial_year=year
+                ))
+            else:
+                print(f"[WARN] Could not parse year from: {pdf_file.name} (skipping)")
+
+    return jobs
+
+
+def process_single_extraction(
+    job: ExtractionJob,
+    deepseek_api_key: str,
+    gemini_api_key: str,
+    db_path: str,
+    model: str = "deepseek-chat",
+    num_samples: int = 3,
+    max_pages: Optional[int] = None
+) -> Dict:
+    """
+    Process a single extraction job (designed for multiprocessing).
+
+    This function is designed to be called by ProcessPoolExecutor.
+    Each process gets its own extractor instance and database connection.
+
+    Args:
+        job: ExtractionJob to process
+        deepseek_api_key: DeepSeek API key
+        gemini_api_key: Gemini API key
+        db_path: Path to SQLite database
+        model: DeepSeek model to use
+        num_samples: Number of samples for self-consistency
+        max_pages: Maximum pages to process
+
+    Returns:
+        Result dictionary with success status and extracted data
+    """
+    try:
+        # Create extractor instance (each process needs its own)
+        extractor = PDFFinancialExtractor(
+            api_key=deepseek_api_key,
+            gemini_api_key=gemini_api_key,
+            use_database=True,
+            db_path=db_path
+        )
+
+        print(f"\n[{job.company_name} / {job.financial_year}] Starting extraction...")
+        print(f"[{job.company_name} / {job.financial_year}] File: {job.pdf_path}")
+
+        # Always use OCR preprocessing for batch mode
+        result = extractor.extract_with_ocr_preprocessing(
+            pdf_path=job.pdf_path,
+            max_pages=max_pages,
+            model=model,
+            save_ocr=True,
+            num_samples=num_samples,
+            company_name=job.company_name,
+            financial_year=job.financial_year
+        )
+
+        if result["success"]:
+            print(f"[{job.company_name} / {job.financial_year}] ✓ Extraction completed")
+        else:
+            print(f"[{job.company_name} / {job.financial_year}] ✗ Extraction failed: {result.get('error', 'Unknown error')}")
+
+        return {
+            "job": job,
+            "result": result
+        }
+
+    except Exception as e:
+        print(f"[{job.company_name} / {job.financial_year}] ✗ Exception: {type(e).__name__}: {e}")
+        return {
+            "job": job,
+            "result": {
+                "success": False,
+                "error": str(e),
+                "file": job.pdf_path,
+                "company_name": job.company_name,
+                "financial_year": job.financial_year
+            }
+        }
 
 
 class PDFFinancialExtractor:
@@ -753,7 +924,9 @@ OCRed Document Text:
         max_pages: Optional[int] = None,
         model: str = "deepseek-chat",
         save_ocr: bool = True,
-        num_samples: int = 3
+        num_samples: int = 3,
+        company_name: Optional[str] = None,
+        financial_year: Optional[str] = None
     ) -> Dict:
         """
         Two-stage extraction with self-consistency: OCR then extract with consensus.
@@ -776,6 +949,8 @@ OCRed Document Text:
             model: DeepSeek model to use
             save_ocr: Save OCRed text to file
             num_samples: Number of samples for self-consistency (default: 3)
+            company_name: Name of the company being analyzed
+            financial_year: Financial year for the data being extracted
 
         Returns:
             Dictionary containing extracted financial metrics with confidence scores
@@ -809,9 +984,15 @@ OCRed Document Text:
                 pdf_id=pdf_id,
                 model=model,
                 num_samples=num_samples,
-                extraction_method="ocr_text_with_consistency"
+                extraction_method="ocr_text_with_consistency",
+                company_name=company_name,
+                financial_year=financial_year
             )
             print(f"[DB] ✓ Created extraction attempt #{attempt_id}")
+            if company_name:
+                print(f"[DB]   Company: {company_name}")
+            if financial_year:
+                print(f"[DB]   Financial Year: {financial_year}")
 
         # Stage 2 & 3: Extract with self-consistency
         try:
@@ -841,6 +1022,14 @@ OCRed Document Text:
             "pdf_id": pdf_id,
             "attempt_id": attempt_id
         }
+
+        # Add company and financial year metadata
+        if company_name or financial_year:
+            result["company_metadata"] = {}
+            if company_name:
+                result["company_metadata"]["company_name"] = company_name
+            if financial_year:
+                result["company_metadata"]["financial_year"] = financial_year
 
         return result
 
@@ -1241,17 +1430,258 @@ OCRed Document Text:
             "usage": total_usage
         }
 
+    @staticmethod
+    def batch_extract_from_folder(
+        root_folder: str,
+        filter_companies: Optional[List[str]] = None,
+        max_workers: int = 2,
+        deepseek_api_key: Optional[str] = None,
+        gemini_api_key: Optional[str] = None,
+        db_path: str = "./extractions.db",
+        model: str = "deepseek-chat",
+        num_samples: int = 3,
+        max_pages: Optional[int] = None,
+        output_dir: Optional[str] = None
+    ) -> Dict:
+        """
+        Batch extract financial data from multiple PDFs in a folder structure.
+
+        Scans root folder for company subfolders, identifies PDFs with years,
+        and processes them in parallel.
+
+        Directory structure expected:
+            root_folder/
+            ├── Company_A/
+            │   ├── report-2021.pdf
+            │   ├── report-2022.pdf
+            │   └── report-2023.pdf
+            └── Company_B/
+                └── annual-2023.pdf
+
+        Args:
+            root_folder: Path to root folder containing company subfolders
+            filter_companies: Optional list of company names to filter (None = all)
+            max_workers: Maximum parallel workers (default: 2, recommended: 2-4)
+            deepseek_api_key: DeepSeek API key
+            gemini_api_key: Gemini API key
+            db_path: Path to SQLite database
+            model: DeepSeek model to use
+            num_samples: Number of samples for self-consistency
+            max_pages: Maximum pages per PDF
+            output_dir: Optional directory to save individual results JSON files
+
+        Returns:
+            Dictionary with batch processing results and statistics
+        """
+        # Get API keys
+        deepseek_key = deepseek_api_key or DEEPSEEK_API_KEY
+        gemini_key = gemini_api_key or GEMINI_API_KEY
+
+        if not deepseek_key:
+            raise ValueError("DEEPSEEK_API_KEY not found")
+        if not gemini_key:
+            raise ValueError("GEMINI_API_KEY not found")
+
+        print(f"\n{'='*70}")
+        print(f"BATCH EXTRACTION MODE")
+        print(f"{'='*70}")
+        print(f"Root folder: {root_folder}")
+        print(f"Max workers: {max_workers}")
+        print(f"Model: {model}")
+        print(f"Samples per extraction: {num_samples}")
+
+        # Scan for extraction jobs
+        print(f"\n[SCAN] Scanning folder structure...")
+        jobs = scan_company_folders(root_folder, filter_companies)
+
+        if not jobs:
+            print(f"[SCAN] ✗ No extraction jobs found")
+            if filter_companies:
+                print(f"[SCAN] Filtered companies: {', '.join(filter_companies)}")
+            return {
+                "success": False,
+                "error": "No extraction jobs found",
+                "total_jobs": 0
+            }
+
+        print(f"[SCAN] ✓ Found {len(jobs)} extraction jobs")
+
+        # Group jobs by company
+        companies_found = {}
+        for job in jobs:
+            if job.company_name not in companies_found:
+                companies_found[job.company_name] = []
+            companies_found[job.company_name].append(job.financial_year)
+
+        print(f"[SCAN] Companies: {len(companies_found)}")
+        for company, years in sorted(companies_found.items()):
+            print(f"[SCAN]   - {company}: {len(years)} reports ({', '.join(sorted(years))})")
+
+        if filter_companies:
+            print(f"[SCAN] Filtering: {', '.join(filter_companies)}")
+
+        # Create output directory if specified
+        if output_dir:
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+            print(f"[OUTPUT] Results will be saved to: {output_dir}")
+
+        # Process jobs in parallel
+        print(f"\n{'='*70}")
+        print(f"PROCESSING {len(jobs)} JOBS (max {max_workers} parallel)")
+        print(f"{'='*70}\n")
+
+        results = []
+        completed = 0
+        failed = 0
+        start_time = time.time()
+
+        # Use ProcessPoolExecutor for parallel processing
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all jobs
+            future_to_job = {
+                executor.submit(
+                    process_single_extraction,
+                    job,
+                    deepseek_key,
+                    gemini_key,
+                    db_path,
+                    model,
+                    num_samples,
+                    max_pages
+                ): job
+                for job in jobs
+            }
+
+            # Process results as they complete
+            for future in as_completed(future_to_job):
+                job = future_to_job[future]
+                try:
+                    result_data = future.result()
+                    results.append(result_data)
+
+                    if result_data["result"]["success"]:
+                        completed += 1
+                        print(f"\n[PROGRESS] {completed}/{len(jobs)} completed, {failed} failed")
+
+                        # Save individual result if output_dir specified
+                        if output_dir:
+                            output_file = Path(output_dir) / f"{job.company_name}_{job.financial_year}.json"
+                            with open(output_file, 'w') as f:
+                                json.dump(result_data["result"], f, indent=2)
+                            print(f"[OUTPUT] Saved: {output_file.name}")
+                    else:
+                        failed += 1
+                        print(f"\n[PROGRESS] {completed}/{len(jobs)} completed, {failed} failed")
+
+                except Exception as e:
+                    failed += 1
+                    print(f"\n[ERROR] Job failed with exception: {e}")
+                    print(f"[PROGRESS] {completed}/{len(jobs)} completed, {failed} failed")
+                    results.append({
+                        "job": job,
+                        "result": {
+                            "success": False,
+                            "error": str(e),
+                            "file": job.pdf_path
+                        }
+                    })
+
+        elapsed_time = time.time() - start_time
+
+        # Print summary
+        print(f"\n{'='*70}")
+        print(f"BATCH EXTRACTION COMPLETE")
+        print(f"{'='*70}")
+        print(f"Total jobs: {len(jobs)}")
+        print(f"Successful: {completed}")
+        print(f"Failed: {failed}")
+        print(f"Time elapsed: {elapsed_time:.1f}s ({elapsed_time/60:.1f} minutes)")
+        if completed > 0:
+            print(f"Average time per job: {elapsed_time/len(jobs):.1f}s")
+
+        # Group results by company
+        print(f"\nRESULTS BY COMPANY:")
+        company_results = {}
+        for res in results:
+            job = res["job"]
+            company = job.company_name
+            if company not in company_results:
+                company_results[company] = {"success": 0, "failed": 0}
+
+            if res["result"]["success"]:
+                company_results[company]["success"] += 1
+            else:
+                company_results[company]["failed"] += 1
+
+        for company, stats in sorted(company_results.items()):
+            total = stats["success"] + stats["failed"]
+            print(f"  {company}: {stats['success']}/{total} successful")
+
+        return {
+            "success": True,
+            "total_jobs": len(jobs),
+            "successful": completed,
+            "failed": failed,
+            "elapsed_time": elapsed_time,
+            "results": results,
+            "company_summary": company_results
+        }
+
 
 def main():
     """Main entry point for the script."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Extract financial data from PDF annual reports using DeepSeek API"
+        description="Extract financial data from PDF annual reports using DeepSeek API",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single file extraction
+  python pdf_extractor.py report.pdf --company "SGL Limited" --year "2023"
+
+  # Batch extraction from folder (all companies)
+  python pdf_extractor.py --folder ./reports --workers 4
+
+  # Batch extraction for specific companies
+  python pdf_extractor.py --folder ./reports --companies "SGL Limited" "Company B" --workers 2
+
+  # Batch extraction with output directory
+  python pdf_extractor.py --folder ./reports --output-dir ./results --workers 3
+
+  # Export results to CSV
+  python pdf_extractor.py --export results.csv --confidence
+
+  # Export specific company/year
+  python pdf_extractor.py --export results.csv --company "SGL Limited" --year "2023"
+
+Folder Structure:
+  reports/
+  ├── SGL Limited/
+  │   ├── report-2021.pdf
+  │   ├── report-2022.pdf
+  │   └── report-2023.pdf
+  └── Another Company/
+      └── annual-2023.pdf
+        """
     )
+
+    # Mode selection (either single file or folder batch)
     parser.add_argument(
         "pdf_path",
-        help="Path to the PDF file to process"
+        nargs="?",
+        help="Path to the PDF file to process (single file mode)"
+    )
+    parser.add_argument(
+        "--folder",
+        help="Path to root folder containing company subfolders (batch mode)",
+        default=None
+    )
+    parser.add_argument(
+        "--export",
+        help="Export database results to CSV file (export mode)",
+        default=None
     )
     parser.add_argument(
         "-o", "--output",
@@ -1312,106 +1742,250 @@ def main():
         help="Save OCR text to file (only with --use-ocr)",
         default=True
     )
+    parser.add_argument(
+        "--company",
+        help="Company name for the financial data being extracted",
+        default=None
+    )
+    parser.add_argument(
+        "--year",
+        help="Financial year for the data being extracted (e.g., '2023', 'FY2022-23')",
+        default=None
+    )
+
+    # Batch mode arguments
+    parser.add_argument(
+        "--companies",
+        nargs="+",
+        help="Filter specific companies to process (batch mode only)",
+        default=None
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Maximum parallel workers for batch processing (default: 2, recommended: 2-4)",
+        default=2
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Directory to save individual extraction results (batch mode only)",
+        default=None
+    )
+    parser.add_argument(
+        "--batch-summary",
+        help="Save batch summary to JSON file (batch mode only)",
+        default=None
+    )
+
+    # Export mode arguments
+    parser.add_argument(
+        "--confidence",
+        action="store_true",
+        help="Include confidence rate columns in CSV export (export mode only)"
+    )
+    parser.add_argument(
+        "--sector",
+        help="Sector name for CSV export (export mode only)",
+        default=""
+    )
+    parser.add_argument(
+        "--sector-short",
+        help="Short sector name for CSV export (export mode only)",
+        default=""
+    )
+    parser.add_argument(
+        "--code",
+        help="Code field for CSV export (export mode only)",
+        default=""
+    )
+    parser.add_argument(
+        "--db",
+        help="Database path (default: ./extractions.db)",
+        default="./extractions.db"
+    )
 
     args = parser.parse_args()
 
+    # Validate arguments
+    if args.export:
+        # Export mode - doesn't need pdf_path or folder
+        pass
+    elif not args.folder and not args.pdf_path:
+        parser.error("Either provide a PDF file path, use --folder for batch mode, or use --export for export mode")
+
+    if args.folder and args.pdf_path:
+        parser.error("Cannot use both single file mode and --folder batch mode simultaneously")
+
+    if args.export and (args.folder or args.pdf_path):
+        parser.error("Cannot use --export with extraction modes (--folder or pdf_path)")
+
     try:
-        # Initialize extractor
-        extractor = PDFFinancialExtractor(api_key=args.api_key)
+        # EXPORT MODE: Export database results to CSV
+        if args.export:
+            from csv_exporter import export_to_csv
 
-        # Determine extraction method
-        if args.use_ocr:
-            # OCR preprocessing method (recommended for large PDFs)
-            result = extractor.extract_with_ocr_preprocessing(
-                pdf_path=args.pdf_path,
-                max_pages=args.max_pages,
-                model=args.model,
-                save_ocr=args.save_ocr
+            print(f"\n{'='*70}")
+            print(f"CSV EXPORT MODE")
+            print(f"{'='*70}")
+            print(f"Database: {args.db}")
+            print(f"Output CSV: {args.export}")
+            if args.company:
+                print(f"Filter: Company = {args.company}")
+            if args.year:
+                print(f"Filter: Year = {args.year}")
+            if args.confidence:
+                print(f"Include confidence rates: Yes")
+
+            count = export_to_csv(
+                db_path=args.db,
+                output_file=args.export,
+                include_confidence=args.confidence,
+                company_filter=args.company,
+                year_filter=args.year,
+                sector=args.sector,
+                sector_short=args.sector_short,
+                code=args.code
             )
-        elif args.self_consistency:
-            result = extractor.extract_with_self_consistency(
-                pdf_path=args.pdf_path,
+
+            print(f"\n{'='*70}")
+            print(f"EXPORT COMPLETE")
+            print(f"{'='*70}")
+            print(f"Records exported: {count}")
+            print(f"Output file: {args.export}")
+
+            return 0
+
+        # BATCH MODE: Process entire folder
+        elif args.folder:
+            result = PDFFinancialExtractor.batch_extract_from_folder(
+                root_folder=args.folder,
+                filter_companies=args.companies,
+                max_workers=args.workers,
+                deepseek_api_key=args.api_key,
+                gemini_api_key=None,  # Will use env var
+                model=args.model,
                 num_samples=args.num_samples,
-                model=args.model,
                 max_pages=args.max_pages,
-                temperature=args.temperature
-            )
-        else:
-            result = extractor.extract_financial_data(
-                pdf_path=args.pdf_path,
-                model=args.model,
-                max_pages=args.max_pages
+                output_dir=args.output_dir
             )
 
-        # Display results
-        if result["success"]:
-            print("\n" + "="*60)
-            if result.get("self_consistency", {}).get("enabled"):
-                print("SELF-CONSISTENCY EXTRACTION SUCCESSFUL")
-            else:
-                print("EXTRACTION SUCCESSFUL")
-            print("="*60)
-
-            # Show self-consistency statistics
-            if result.get("self_consistency", {}).get("enabled"):
-                sc = result["self_consistency"]
-                stats = result.get("statistics", {})
-                print(f"\nSELF-CONSISTENCY MODE:")
-                print(f"  Samples: {sc['num_samples']}/{sc['requested_samples']}")
-                print(f"  Temperature: {sc['temperature']}")
-                print(f"\nCONFIDENCE SUMMARY:")
-                print(f"  High confidence: {stats.get('high_confidence', 0)}/{stats.get('total_metrics', 0)} metrics")
-                print(f"  Medium confidence: {stats.get('medium_confidence', 0)}/{stats.get('total_metrics', 0)} metrics")
-                print(f"  Low confidence: {stats.get('low_confidence', 0)}/{stats.get('total_metrics', 0)} metrics")
-
-            if args.show_reasoning:
-                if result.get("self_consistency", {}).get("enabled"):
-                    print("\nMODEL REASONING (Sample 1):")
-                    print("-"*60)
-                    print(result["samples"]["all_reasoning"][0])
-                    print("-"*60)
-                else:
-                    print("\nMODEL REASONING:")
-                    print("-"*60)
-                    print(result["reasoning"])
-                    print("-"*60)
-
-            print("\nEXTRACTED FINANCIAL DATA:")
-            print("-"*60)
-            print(json.dumps(result["extracted_data"], indent=2))
-
-            # Show detailed confidence metrics if requested
-            if args.show_confidence and result.get("confidence_metrics"):
-                print("\nDETAILED CONFIDENCE METRICS:")
-                print("-"*60)
-                for metric, details in result["confidence_metrics"].items():
-                    print(f"\n{metric}:")
-                    print(f"  Value: {details['final_value']}")
-                    print(f"  Confidence: {details['confidence_score']} ({details['confidence_level']})")
-                    print(f"  Agreement: {details['agreement']}")
-                    if len(details.get('vote_distribution', {})) > 1:
-                        print(f"  Vote distribution: {details['vote_distribution']}")
-                    if 'warning' in details:
-                        print(f"  ⚠️  {details['warning']}")
-
-            print("\nAPI USAGE:")
-            print(f"  Prompt tokens: {result['usage']['prompt_tokens']:,}")
-            print(f"  Completion tokens: {result['usage']['completion_tokens']:,}")
-            print(f"  Total tokens: {result['usage']['total_tokens']:,}")
-
-            # Save to file if specified
-            if args.output:
-                with open(args.output, 'w') as f:
+            # Save batch summary if requested
+            if args.batch_summary and result["success"]:
+                with open(args.batch_summary, 'w') as f:
                     json.dump(result, f, indent=2)
-                print(f"\nFull results saved to: {args.output}")
-        else:
-            print("\n" + "="*60)
-            print("EXTRACTION FAILED")
-            print("="*60)
-            print(f"Error: {result['error']}")
-            return 1
+                print(f"\n[OUTPUT] Batch summary saved to: {args.batch_summary}")
 
-        return 0
+            return 0 if result["success"] and result["failed"] == 0 else 1
+
+        # SINGLE FILE MODE: Process one PDF
+        else:
+            # Initialize extractor
+            extractor = PDFFinancialExtractor(api_key=args.api_key)
+
+            # In single file mode, always use OCR if not explicitly using other methods
+            if args.use_ocr or (not args.self_consistency):
+                # OCR preprocessing method (default and recommended)
+                result = extractor.extract_with_ocr_preprocessing(
+                    pdf_path=args.pdf_path,
+                    max_pages=args.max_pages,
+                    model=args.model,
+                    save_ocr=args.save_ocr,
+                    num_samples=args.num_samples,
+                    company_name=args.company,
+                    financial_year=args.year
+                )
+            elif args.self_consistency:
+                result = extractor.extract_with_self_consistency(
+                    pdf_path=args.pdf_path,
+                    num_samples=args.num_samples,
+                    model=args.model,
+                    max_pages=args.max_pages,
+                    temperature=args.temperature
+                )
+            else:
+                result = extractor.extract_financial_data(
+                    pdf_path=args.pdf_path,
+                    model=args.model,
+                    max_pages=args.max_pages
+                )
+
+            # Display results (single file mode only)
+            if result["success"]:
+                print("\n" + "="*60)
+                if result.get("self_consistency", {}).get("enabled"):
+                    print("SELF-CONSISTENCY EXTRACTION SUCCESSFUL")
+                else:
+                    print("EXTRACTION SUCCESSFUL")
+                print("="*60)
+
+                # Show company metadata if available
+                if result.get("company_metadata"):
+                    print("\nCOMPANY INFORMATION:")
+                    if result["company_metadata"].get("company_name"):
+                        print(f"  Company: {result['company_metadata']['company_name']}")
+                    if result["company_metadata"].get("financial_year"):
+                        print(f"  Financial Year: {result['company_metadata']['financial_year']}")
+
+                # Show self-consistency statistics
+                if result.get("self_consistency", {}).get("enabled"):
+                    sc = result["self_consistency"]
+                    stats = result.get("statistics", {})
+                    print(f"\nSELF-CONSISTENCY MODE:")
+                    print(f"  Samples: {sc['num_samples']}/{sc['requested_samples']}")
+                    print(f"  Temperature: {sc['temperature']}")
+                    print(f"\nCONFIDENCE SUMMARY:")
+                    print(f"  High confidence: {stats.get('high_confidence', 0)}/{stats.get('total_metrics', 0)} metrics")
+                    print(f"  Medium confidence: {stats.get('medium_confidence', 0)}/{stats.get('total_metrics', 0)} metrics")
+                    print(f"  Low confidence: {stats.get('low_confidence', 0)}/{stats.get('total_metrics', 0)} metrics")
+
+                if args.show_reasoning:
+                    if result.get("self_consistency", {}).get("enabled"):
+                        print("\nMODEL REASONING (Sample 1):")
+                        print("-"*60)
+                        print(result["samples"]["all_reasoning"][0])
+                        print("-"*60)
+                    else:
+                        print("\nMODEL REASONING:")
+                        print("-"*60)
+                        print(result["reasoning"])
+                        print("-"*60)
+
+                print("\nEXTRACTED FINANCIAL DATA:")
+                print("-"*60)
+                print(json.dumps(result["extracted_data"], indent=2))
+
+                # Show detailed confidence metrics if requested
+                if args.show_confidence and result.get("confidence_metrics"):
+                    print("\nDETAILED CONFIDENCE METRICS:")
+                    print("-"*60)
+                    for metric, details in result["confidence_metrics"].items():
+                        print(f"\n{metric}:")
+                        print(f"  Value: {details['final_value']}")
+                        print(f"  Confidence: {details['confidence_score']} ({details['confidence_level']})")
+                        print(f"  Agreement: {details['agreement']}")
+                        if len(details.get('vote_distribution', {})) > 1:
+                            print(f"  Vote distribution: {details['vote_distribution']}")
+                        if 'warning' in details:
+                            print(f"  ⚠️  {details['warning']}")
+
+                print("\nAPI USAGE:")
+                print(f"  Prompt tokens: {result['usage']['prompt_tokens']:,}")
+                print(f"  Completion tokens: {result['usage']['completion_tokens']:,}")
+                print(f"  Total tokens: {result['usage']['total_tokens']:,}")
+
+                # Save to file if specified
+                if args.output:
+                    with open(args.output, 'w') as f:
+                        json.dump(result, f, indent=2)
+                    print(f"\nFull results saved to: {args.output}")
+            else:
+                print("\n" + "="*60)
+                print("EXTRACTION FAILED")
+                print("="*60)
+                print(f"Error: {result['error']}")
+                return 1
+
+            return 0
 
     except Exception as e:
         print(f"\nError: {e}")

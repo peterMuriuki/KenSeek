@@ -64,6 +64,8 @@ class ExtractionDatabase:
             CREATE TABLE IF NOT EXISTS extraction_attempts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 pdf_id INTEGER NOT NULL,
+                company_name TEXT,
+                financial_year TEXT,
                 model TEXT NOT NULL,
                 num_samples INTEGER,
                 extraction_method TEXT,
@@ -256,7 +258,9 @@ class ExtractionDatabase:
         return [row['ocr_text'] for row in rows]
 
     def create_extraction_attempt(self, pdf_id: int, model: str,
-                                 num_samples: int, extraction_method: str) -> int:
+                                 num_samples: int, extraction_method: str,
+                                 company_name: Optional[str] = None,
+                                 financial_year: Optional[str] = None) -> int:
         """
         Create new extraction attempt record.
 
@@ -265,6 +269,8 @@ class ExtractionDatabase:
             model: Model used for extraction
             num_samples: Number of samples for self-consistency
             extraction_method: "ocr_text" or "direct_image"
+            company_name: Name of the company being analyzed
+            financial_year: Financial year for the data being extracted
 
         Returns:
             Attempt ID
@@ -272,9 +278,9 @@ class ExtractionDatabase:
         cursor = self.conn.cursor()
         cursor.execute("""
             INSERT INTO extraction_attempts
-            (pdf_id, model, num_samples, extraction_method, started_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (pdf_id, model, num_samples, extraction_method, datetime.now()))
+            (pdf_id, company_name, financial_year, model, num_samples, extraction_method, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (pdf_id, company_name, financial_year, model, num_samples, extraction_method, datetime.now()))
 
         self.conn.commit()
         return cursor.lastrowid
@@ -330,9 +336,9 @@ class ExtractionDatabase:
                 attempt_id,
                 metric_name,
                 consensus_value,
-                confidence_info.get('confidence', 'unknown'),
-                confidence_info.get('agreement', 0.0),
-                json.dumps(confidence_info.get('votes', {}))
+                confidence_info.get('confidence_level', 'unknown'),
+                confidence_info.get('confidence_score', 0.0),
+                json.dumps(confidence_info.get('vote_distribution', {}))
             ))
 
         self.conn.commit()
@@ -415,6 +421,78 @@ class ExtractionDatabase:
         """)
 
         return {row['service']: row['total_cost'] for row in cursor.fetchall()}
+
+    def get_all_successful_extractions(self, company_name: Optional[str] = None,
+                                      financial_year: Optional[str] = None) -> List[Dict]:
+        """
+        Get all successful extraction attempts with their results.
+
+        Args:
+            company_name: Optional filter by company name
+            financial_year: Optional filter by financial year
+
+        Returns:
+            List of extraction records with results and confidence metrics
+        """
+        cursor = self.conn.cursor()
+
+        # Build query with optional filters
+        query = """
+            SELECT
+                ea.id as attempt_id,
+                ea.company_name,
+                ea.financial_year,
+                ea.model,
+                ea.num_samples,
+                ea.started_at,
+                ea.completed_at,
+                p.file_path,
+                p.file_hash
+            FROM extraction_attempts ea
+            JOIN pdfs p ON ea.pdf_id = p.id
+            WHERE ea.success = 1
+        """
+        params = []
+
+        if company_name:
+            query += " AND ea.company_name = ?"
+            params.append(company_name)
+
+        if financial_year:
+            query += " AND ea.financial_year = ?"
+            params.append(financial_year)
+
+        query += " ORDER BY ea.company_name, ea.financial_year"
+
+        cursor.execute(query, params)
+        attempts = [dict(row) for row in cursor.fetchall()]
+
+        # For each attempt, get the extraction results
+        for attempt in attempts:
+            attempt_id = attempt['attempt_id']
+
+            # Get all extraction results for this attempt
+            cursor.execute("""
+                SELECT metric_name, consensus_value, confidence, agreement_rate, vote_distribution
+                FROM extraction_results
+                WHERE attempt_id = ?
+            """, (attempt_id,))
+
+            results = {}
+            confidence_scores = {}
+
+            for row in cursor.fetchall():
+                metric_name = row['metric_name']
+                results[metric_name] = row['consensus_value']
+                confidence_scores[metric_name] = {
+                    'confidence': row['confidence'],
+                    'agreement_rate': row['agreement_rate']
+                }
+
+            attempt['extracted_data'] = results
+            attempt['confidence_metrics'] = confidence_scores
+
+        return attempts
 
     def close(self):
         """Close database connection."""
