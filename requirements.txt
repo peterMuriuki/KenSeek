@@ -1,14 +1,13 @@
-openai>=1.0.0
+# Core PDF and Image Processing
 pdf2image>=1.16.0
 Pillow>=10.0.0
+
+# AI/ML APIs
+openai>=1.0.0
+google-generativeai>=0.3.0
+
+# Environment and Configuration
 python-dotenv>=1.0.0
-rich>=13.0.0
-questionary>=2.0.0
 
-# Google Gemini API (for OCR preprocessing)
-google-generativeai>=0.8.0
-
-# OCR Mode (optional - for local OCR with DeepSeek-OCR - not recommended)
-# transformers>=4.36.0
-# torch>=2.0.0
-# accelerate>=0.25.0
+# Database (built-in sqlite3, no package needed)
+# Data Processing (built-in json, csv, no packages needed)
